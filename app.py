@@ -12,36 +12,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BSD_LIVE_URL = "https://sports.bzzoiro.com/api/v2/events/live/"
 
-# Daha sonra kupondan otomatik oluşturacağız.
 COUPON = [
-    {
-        "home": "Mallorca B",
-        "away": "Deportiva Minera",
-        "bet": "HT_DRAW"
-    },
-    {
-        "home": "Tenerife B",
-        "away": "Atletico Central",
-        "bet": "HT_DRAW"
-    },
-    {
-        "home": "Puertollano C.F.",
-        "away": "Atl. Paso",
-        "bet": "HOME_WIN"
-    },
-    {
-        "home": "Eintracht Frankfurt U19",
-        "away": "RB Leipzig U19",
-        "bet": "HOME_WIN"
-    },
-    {
-        "home": "Sassuolo Women",
-        "away": "AS Roma Women",
-        "bet": "AWAY_WIN"
-    }
+    {"home": "Mallorca B", "away": "Deportiva Minera", "bet": "HT_DRAW"},
+    {"home": "Tenerife B", "away": "Atletico Central", "bet": "HT_DRAW"},
+    {"home": "Puertollano C.F.", "away": "Atl. Paso", "bet": "HOME_WIN"},
+    {"home": "Eintracht Frankfurt U19", "away": "RB Leipzig U19", "bet": "HOME_WIN"},
+    {"home": "Sassuolo Women", "away": "AS Roma Women", "bet": "AWAY_WIN"},
 ]
 
 previous_scores = {}
+monitor_started = False
+monitor_lock = threading.Lock()
 
 
 def telegram(message):
@@ -49,17 +30,16 @@ def telegram(message):
         print("Telegram ayarlari eksik.")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
-        requests.post(
-            url,
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message
             },
             timeout=10
         )
+        response.raise_for_status()
     except Exception as e:
         print("Telegram hata:", e)
 
@@ -69,14 +49,11 @@ def get_live_matches():
         print("BSD_API_TOKEN eksik.")
         return []
 
-    headers = {
-        "Authorization": f"Token {BSD_TOKEN}"
-    }
-
     try:
         response = requests.get(
             BSD_LIVE_URL,
-            headers=headers,
+            headers={"Authorization": f"Token {BSD_TOKEN}"},
+            params={"limit": 200},
             timeout=15
         )
 
@@ -86,17 +63,18 @@ def get_live_matches():
         if isinstance(data, list):
             return data
 
-        return data.get("results", data.get("events", []))
+        if isinstance(data, dict):
+            return data.get("results", data.get("events", []))
+
+        return []
 
     except Exception as e:
         print("BSD API hata:", e)
         return []
 
 
-def text(value):
-    if value is None:
-        return ""
-    return str(value).lower().strip()
+def normalize(value):
+    return str(value or "").lower().strip()
 
 
 def team_name(team):
@@ -112,8 +90,6 @@ def team_name(team):
 
 
 def score_value(match, side):
-    candidates = []
-
     if side == "home":
         candidates = [
             match.get("home_score"),
@@ -136,7 +112,7 @@ def score_value(match, side):
         try:
             if value is not None:
                 return int(value)
-        except:
+        except (ValueError, TypeError):
             pass
 
     return 0
@@ -144,23 +120,22 @@ def score_value(match, side):
 
 def find_coupon_match(live_match):
     home = team_name(
-        live_match.get("home_team")
-        or live_match.get("home")
+        live_match.get("home_team") or live_match.get("home")
     )
-
     away = team_name(
-        live_match.get("away_team")
-        or live_match.get("away")
+        live_match.get("away_team") or live_match.get("away")
     )
 
     for coupon_match in COUPON:
-        if (
-            text(coupon_match["home"]) in text(home)
-            or text(home) in text(coupon_match["home"])
-        ) and (
-            text(coupon_match["away"]) in text(away)
-            or text(away) in text(coupon_match["away"])
-        ):
+        ch = normalize(coupon_match["home"])
+        ca = normalize(coupon_match["away"])
+        lh = normalize(home)
+        la = normalize(away)
+
+        home_ok = ch in lh or lh in ch
+        away_ok = ca in la or la in ca
+
+        if home_ok and away_ok:
             return coupon_match, home, away
 
     return None, home, away
@@ -168,93 +143,73 @@ def find_coupon_match(live_match):
 
 def goal_message(coupon_match, home, away, hs, as_):
     bet = coupon_match["bet"]
-    total = hs + as_
 
     if bet == "HT_DRAW":
         if hs == as_:
             return (
-                f"⚽💚 GOOOL! {home} {hs}-{as_} {away}\n"
+                f"🥅⚽⚽💚💚 GOOOL BE!\n"
+                f"{home} {hs}-{as_} {away}\n"
                 f"İlk yarı beraberlik yeniden geliyor 🙏🏻"
             )
 
         scoring_team = home if hs > as_ else away
 
         return (
-            f"🥺⚽ {scoring_team} gol attı! "
+            f"🥺❌ {scoring_team} gol attı!\n"
             f"{home} {hs}-{as_} {away}\n"
-            f"İlk yarı beraberlik için eşitlik golü lazım 🙏🏻"
+            f"İlk yarı beraberlik gelmesi için eşitlik lazım 🙏🏻"
         )
 
     if bet == "HOME_WIN":
         if hs > as_:
             return (
-                f"🥅⚽💚 GOOOL BE! "
-                f"{home} {hs}-{as_} önde!\n"
+                f"🥅⚽💚 GOOOL BE!\n"
+                f"{home} {hs}-{as_} {away}\n"
                 f"{home} galibiyeti şu an geliyor 🙏🏻🔥"
             )
 
         if hs < as_:
             return (
-                f"🥺❌ {away} öne geçti: "
+                f"🥺❌ {away} gol attı!\n"
                 f"{home} {hs}-{as_} {away}\n"
-                f"{home} dönüşü lazım 🙏🏻"
+                f"{home} için dönüş lazım 🙏🏻"
             )
 
         return (
-            f"⚽ {home} {hs}-{as_} {away}\n"
-            f"Beraberlik oldu, {home} için 1 gol lazım 🙏🏻"
+            f"⚽💚 {home} {hs}-{as_} {away}\n"
+            f"Beraberlik oldu. {home} için 1 gol lazım 🙏🏻"
         )
 
     if bet == "AWAY_WIN":
         if as_ > hs:
             return (
-                f"🥅⚽💚 GOOOL BE! "
-                f"{away} {as_}-{hs} önde!\n"
+                f"🥅⚽💚 GOOOL BE!\n"
+                f"{home} {hs}-{as_} {away}\n"
                 f"{away} galibiyeti şu an geliyor 🙏🏻🔥"
             )
 
         if as_ < hs:
             return (
-                f"🥺❌ {home} öne geçti: "
+                f"🥺❌ {home} gol attı!\n"
                 f"{home} {hs}-{as_} {away}\n"
-                f"{away} dönüşü lazım 🙏🏻"
+                f"{away} için dönüş lazım 🙏🏻"
             )
 
         return (
-            f"⚽ {home} {hs}-{as_} {away}\n"
-            f"Beraberlik oldu, {away} için 1 gol lazım 🙏🏻"
-        )
-
-    if bet == "OVER_25":
-        remaining = max(0, 3 - total)
-
-        if remaining == 0:
-            return "💚💚💚 GOOOOOL! ✅ 2.5 ÜST GELDİ! 🔥"
-
-        return (
-            f"🥅⚽💚 GOOOL BE!\n"
-            f"2.5 Üst için {remaining} gol daha lazım 🙏🏻"
-        )
-
-    if bet == "BTTS":
-        if hs > 0 and as_ > 0:
-            return "🔥⚽⚽ KG VAR GELDİ! ✅💚"
-
-        waiting = away if hs > 0 else home
-
-        return (
-            f"⚽💚 İlk gol geldi!\n"
-            f"Şimdi {waiting} takımından gol bekliyoruz 🙏🏻"
+            f"⚽💚 {home} {hs}-{as_} {away}\n"
+            f"Beraberlik oldu. {away} için 1 gol lazım 🙏🏻"
         )
 
     return f"⚽ Gol! {home} {hs}-{as_} {away}"
 
 
 def monitor():
-    telegram("🟢 Kuponumu Takip Et aktif! Canlı maçları bekliyorum ⚽")
+    print("CANLI TAKIP THREAD BASLADI")
 
     while True:
         matches = get_live_matches()
+
+        print(f"BSD canlı maç sayısı: {len(matches)}")
 
         for match in matches:
             coupon_match, home, away = find_coupon_match(match)
@@ -270,12 +225,13 @@ def monitor():
 
             if key not in previous_scores:
                 previous_scores[key] = current
+                print(f"Takibe alındı: {home} {hs}-{as_} {away}")
                 continue
 
             old = previous_scores[key]
 
             if current != old:
-                if (hs + as_) > (old[0] + old[1]):
+                if hs + as_ > old[0] + old[1]:
                     telegram(
                         goal_message(
                             coupon_match,
@@ -291,33 +247,76 @@ def monitor():
         time.sleep(10)
 
 
+def start_monitor():
+    global monitor_started
+
+    with monitor_lock:
+        if monitor_started:
+            return
+
+        monitor_started = True
+
+        thread = threading.Thread(
+            target=monitor,
+            daemon=True,
+            name="live-match-monitor"
+        )
+        thread.start()
+
+        print("Canli mac takip sistemi aktif.")
+
+
+# Gunicorn app.py dosyasını import ettiğinde de çalışır.
+start_monitor()
+
+
 @app.route("/")
 def home():
     return jsonify({
         "status": "online",
         "service": "Kuponumu Takip Et",
-        "matches": len(COUPON)
+        "matches": len(COUPON),
+        "monitor": "active" if monitor_started else "inactive"
     })
 
 
 @app.route("/test")
 def test():
-    telegram("⚽💚 TEST BAŞARILI! Kupon bildirim sistemi çalışıyor 🙏🏻🔥")
+    telegram(
+        "⚽💚 TEST BAŞARILI!\n"
+        "Kupon bildirim sistemi ve canlı takip motoru çalışıyor 🙏🏻🔥"
+    )
 
     return jsonify({
-        "telegram": "test sent"
+        "telegram": "test sent",
+        "monitor": monitor_started
+    })
+
+
+@app.route("/live-check")
+def live_check():
+    matches = get_live_matches()
+
+    found = []
+
+    for match in matches:
+        coupon_match, home, away = find_coupon_match(match)
+
+        if coupon_match:
+            found.append({
+                "home": home,
+                "away": away,
+                "score": f"{score_value(match, 'home')}-{score_value(match, 'away')}",
+                "bet": coupon_match["bet"]
+            })
+
+    return jsonify({
+        "bsd_live_matches": len(matches),
+        "coupon_matches_found": len(found),
+        "found": found
     })
 
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=monitor,
-        daemon=True
-    ).start()
-
     port = int(os.environ.get("PORT", 10000))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
